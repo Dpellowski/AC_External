@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include <iostream>
 #include <windows.h>
 #include <vector>
@@ -243,15 +243,9 @@ public:
 
 private:
     void CachePlayerAddresses() {
-        cachedAddrs.playerX = localPlayerAddr + PlayerOffsets::PLAYERX;
-        cachedAddrs.playerY = localPlayerAddr + PlayerOffsets::PLAYERY;
-        cachedAddrs.playerZ = localPlayerAddr + PlayerOffsets::PLAYERZ;
-        cachedAddrs.playerYaw = localPlayerAddr + PlayerOffsets::YAW;
-        cachedAddrs.playerPitch = localPlayerAddr + PlayerOffsets::PITCH;
-        cachedAddrs.playerHealth = localPlayerAddr + PlayerOffsets::HEALTH;
-        cachedAddrs.playerTeam = localPlayerAddr + PlayerOffsets::TEAM;
-        cachedAddrs.playerDead = localPlayerAddr + PlayerOffsets::IS_DEAD;
-        cachedAddrs.valid = true;
+        // ✅ FIXED: Don't cache addresses during initialization
+        // We'll cache them in ReadLocalPlayerDataFast() after we get the real player pointer
+        cachedAddrs.valid = false;
     }
 
     bool InitializeProcess() {
@@ -274,7 +268,8 @@ private:
             return false;
         }
 
-        localPlayerAddr = moduleBase + GameOffsets::LOCAL_PLAYER_OFFSET;
+        // ✅ FIXED: Don't set localPlayerAddr here - it will be set in ReadLocalPlayerDataFast()
+        localPlayerAddr = 0;  // Will be updated when we read the actual pointer
         return true;
     }
 
@@ -300,16 +295,20 @@ public:
     bool ReadAllGameData() {
         gameData.Clear();
 
-        if (!hProcess || !moduleBase || !cachedAddrs.valid) {
+        if (!hProcess || !moduleBase) {
             return false;
         }
 
-        // Batch read critical data in one operation
+        // Always try to read data - the functions will handle invalid states internally
         ReadViewMatrixFast();
-        ReadLocalPlayerDataFast();
-        ReadAllEntityDataFast();
+        ReadLocalPlayerDataFast();  // This will set cachedAddrs.valid if successful
 
-        return true;
+        // Only read entities if we have valid player data
+        if (cachedAddrs.valid) {
+            ReadAllEntityDataFast();
+        }
+
+        return cachedAddrs.valid;  // Return true only if we successfully read player data
     }
 
 private:
@@ -323,15 +322,58 @@ private:
     }
 
     void ReadLocalPlayerDataFast() {
-        // Use cached addresses for direct reading
-        gameData.localPlayerPosition.x = ReadFloatDirect(cachedAddrs.playerX);
-        gameData.localPlayerPosition.y = ReadFloatDirect(cachedAddrs.playerY);
-        gameData.localPlayerPosition.z = ReadFloatDirect(cachedAddrs.playerZ);
-        gameData.localPlayerYaw = ReadFloatDirect(cachedAddrs.playerYaw);
-        gameData.localPlayerPitch = ReadFloatDirect(cachedAddrs.playerPitch);
-        gameData.localPlayerHealth = ReadIntDirect(cachedAddrs.playerHealth);
-        gameData.localPlayerTeam = ReadIntDirect(cachedAddrs.playerTeam);
-        gameData.localPlayerIsDead = ReadIntDirect(cachedAddrs.playerDead) != 0;
+        uintptr_t actualPlayerAddr = 0;
+        SIZE_T bytesRead = 0;
+        
+        uintptr_t playerPtrAddress = moduleBase + GameOffsets::LOCAL_PLAYER_OFFSET;
+        
+        if (ReadProcessMemory(hProcess, 
+            reinterpret_cast<LPCVOID>(playerPtrAddress),
+            &actualPlayerAddr, sizeof(actualPlayerAddr), &bytesRead)) {
+            
+            if (actualPlayerAddr > 0x10000) {
+                if (localPlayerAddr != actualPlayerAddr) {
+                    localPlayerAddr = actualPlayerAddr;
+                    UpdateCachedAddresses(actualPlayerAddr);
+                }
+                
+                // Read position using correct addresses
+                float x = ReadFloatDirect(cachedAddrs.playerX);
+                float y = ReadFloatDirect(cachedAddrs.playerY);
+                float z = ReadFloatDirect(cachedAddrs.playerZ);
+                
+                gameData.localPlayerPosition.x = x;
+                gameData.localPlayerPosition.y = y;
+                gameData.localPlayerPosition.z = z;
+                
+                gameData.localPlayerHealth = ReadIntDirect(cachedAddrs.playerHealth);
+                gameData.localPlayerTeam = ReadIntDirect(cachedAddrs.playerTeam);
+                gameData.localPlayerIsDead = ReadIntDirect(cachedAddrs.playerDead) != 0;
+                gameData.localPlayerYaw = ReadFloatDirect(cachedAddrs.playerYaw);
+                gameData.localPlayerPitch = ReadFloatDirect(cachedAddrs.playerPitch);
+                
+                cachedAddrs.valid = true;
+            } else {
+                gameData.localPlayerPosition = Position(0.0f, 0.0f, 0.0f);
+                cachedAddrs.valid = false;
+            }
+        } else {
+            gameData.localPlayerPosition = Position(0.0f, 0.0f, 0.0f);
+            cachedAddrs.valid = false;
+        }
+    }
+
+    // ✅ Add this function to update cached addresses
+    void UpdateCachedAddresses(uintptr_t playerAddr) {
+        cachedAddrs.playerX = playerAddr + PlayerOffsets::PLAYERX;
+        cachedAddrs.playerY = playerAddr + PlayerOffsets::PLAYERY;
+        cachedAddrs.playerZ = playerAddr + PlayerOffsets::PLAYERZ;
+        cachedAddrs.playerYaw = playerAddr + PlayerOffsets::YAW;
+        cachedAddrs.playerPitch = playerAddr + PlayerOffsets::PITCH;
+        cachedAddrs.playerHealth = playerAddr + PlayerOffsets::HEALTH;
+        cachedAddrs.playerTeam = playerAddr + PlayerOffsets::TEAM;
+        cachedAddrs.playerDead = playerAddr + PlayerOffsets::IS_DEAD;
+        cachedAddrs.valid = true;
     }
 
     void ReadAllEntityDataFast() {
@@ -521,18 +563,26 @@ private:
         for (auto& entity : gameData.entities) {
             if (entity.address == localPlayerAddr) continue;
 
-            if (!IsValidTargetCandidateFast(entity)) continue;
+            // ✅ FIXED: Calculate distance first, THEN validate
+            const Position& targetPos = entity.headPosition.x != 0 ?
+                entity.headPosition : entity.position;
+            float distanceSquared = gameData.localPlayerPosition.DistanceSquared(targetPos);
+            float distance = sqrt(distanceSquared);
+            
+            // Update cache
+            entity.lastDistanceSquared = distanceSquared;
+            entity.lastUpdateFrame = gameData.currentFrame;
 
-            // Use cached distance if available
-            float distanceSquared;
-            if (entity.lastUpdateFrame == gameData.currentFrame) {
-                const Position& targetPos = entity.headPosition.x != 0 ?
-                    entity.headPosition : entity.position;
-                distanceSquared = gameData.localPlayerPosition.DistanceSquared(targetPos);
-                entity.lastDistanceSquared = distanceSquared;
-            }
-            else {
-                distanceSquared = entity.lastDistanceSquared;
+            // Debug output (optional)
+            // std::cout << "Entity Health=" << entity.health << " Team=" << entity.team 
+            //           << " Distance=" << distance << " MaxDist=" << aimbotSettings.maxDistance << std::endl;
+
+            // Validate
+            if (!entity.isValid || entity.isDead || entity.health <= 0 || 
+                entity.team == gameData.localPlayerTeam || 
+                distanceSquared > aimbotSettings.maxDistanceSquared ||
+                distanceSquared < 1.0f) {
+                continue;
             }
 
             if (distanceSquared < closestDistanceSquared) {
@@ -612,16 +662,25 @@ private:
 
 public:
     void ModifyAmmo() {
-        const int newAmmo = 999;
-        const uintptr_t ammoAddr = localPlayerAddr + PlayerOffsets::ASSAULT_RIFLE_AMMO;
-        WriteProcessMemory(hProcess, reinterpret_cast<LPVOID>(ammoAddr),
-            &newAmmo, sizeof(newAmmo), nullptr);
+        if (cachedAddrs.valid && localPlayerAddr != 0) {
+            const int newAmmo = 999;
+            const uintptr_t ammoAddr = localPlayerAddr + PlayerOffsets::ASSAULT_RIFLE_AMMO;
+            WriteProcessMemory(hProcess, reinterpret_cast<LPVOID>(ammoAddr),
+                &newAmmo, sizeof(newAmmo), nullptr);
+        }
     }
 
     void ModifyHealth() {
-        const int newHealth = 999;
-        WriteProcessMemory(hProcess, reinterpret_cast<LPVOID>(cachedAddrs.playerHealth),
-            &newHealth, sizeof(newHealth), nullptr);
+        if (cachedAddrs.valid && cachedAddrs.playerHealth != 0) {
+            const int newHealth = 100;  // Use 100 instead of 999 for more realistic value
+            SIZE_T bytesWritten = 0;
+            bool success = WriteProcessMemory(hProcess, reinterpret_cast<LPVOID>(cachedAddrs.playerHealth),
+                &newHealth, sizeof(newHealth), &bytesWritten);
+
+            if (!success) {
+                std::cout << "Failed to modify health! Error: " << GetLastError() << std::endl;
+            }
+        }
     }
 
     //=========================================================================
@@ -716,7 +775,7 @@ int main() {
     int frameCount = 0;
 
     while (true) {
-        // Ultra-fast memory reading
+        // Ultra-fast memory reading test
         if (!hack.ReadAllGameData()) {
             Sleep(1);
             continue;
@@ -742,7 +801,7 @@ int main() {
 
             hack.EnumerateEntities();
             hack.PrintTargetInfo();
-            std::cout << "\n[Press 'q' to quit, 'F' to toggle aimbot]" << std::endl;
+            std::cout << "\n[Press 'q' to quit, 'F' to toggle aimbot] extra" << std::endl;
         }
 
         // Render updates
